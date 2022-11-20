@@ -9,7 +9,7 @@ Written in Rust. Clients do not need it installed, but functionality is availabl
 ## Installation
 1. Install [Coqui STT](https://github.com/coqui-ai/STT) and add `libstt.so.if.lib`/`libstt.so` to your machine's PATH environemnt variable.
 2. Download a `.tflite` speech model and place it inside of its own folder in `GarrysMod/garrysmod/lua/bin/goqui`. You can download free compatible models from the [Coqui model archive](https://coqui.ai/models). The name of the folder is name of the model in Lua. The standard is to use ISO 639-1 codes (eg. `en-us` for English (United States) and `ru` for Russian)
-3. Download the matching binary modules from [releases]() (not yet available) and put it in `GarrysMod/garrysmod/lua/bin`.
+3. Download the matching binary modules from [releases](https://github.com/Cryotheus/gmod-goqui/releases) (not yet available) and put it in `GarrysMod/garrysmod/lua/bin`.
 
 ## Functions
 This is for Lua programmers.  
