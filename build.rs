@@ -1,0 +1,1 @@
+fn main() {println!("cargo:rustc-link-search=C:/Users/wised/Documents/Source Code/Rust Linkage/coqui")}
