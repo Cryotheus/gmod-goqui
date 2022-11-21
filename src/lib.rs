@@ -10,6 +10,7 @@ use gmod::gmcl::override_stdout;
 use gmod::lua::{State as GLuaState, LuaFunction, LuaString};
 
 use std::{
+	cell::Cell,
 	collections::HashMap,
 	env::args,
 	fs::{File, ReadDir},
@@ -150,10 +151,44 @@ static MODEL_TABLE: LazyLock<HashMap<String, LoadedCoquiModel>> = LazyLock::new(
 	table
 });
 
+thread_local! {static REMAINING: Cell<usize>  = Cell::new(0);}
+
 //functions
 unsafe fn add_module_function(lua: GLuaState, name: LuaString, func: LuaFunction) {
 	lua.push_function(func);
 	lua.set_field(-2, name);
+}
+
+fn decrement_remaining() -> usize {
+	let mut new = 0usize;
+	
+	REMAINING.with(|remaining| {
+		new = remaining.get() - 1;
+		
+		remaining.set(new);
+	});
+	
+	new
+}
+
+fn get_remaining() -> usize {
+	let mut output = 0usize;
+	
+	REMAINING.with(|remaining| output = remaining.get());
+	
+	output
+}
+
+fn increment_remaining() -> usize {
+	let mut new = 0usize;
+	
+	REMAINING.with(|remaining| {
+		new = remaining.get() + 1;
+		
+		remaining.set(new);
+	});
+	
+	new
 }
 
 unsafe fn pop_module_table(lua: GLuaState, table_name: LuaString) {lua.set_global(table_name)}
@@ -165,6 +200,25 @@ unsafe fn push_module_table(lua: GLuaState, table_name: LuaString) {
 		lua.pop();
 		lua.new_table();
 	}
+}
+
+unsafe fn start_thinking(lua: GLuaState) {
+	lua.get_global(lua_string!("timer"));
+	lua.get_field(-1, lua_string!("Create"));
+	lua.push_string("goqui");
+	lua.push_integer(0);
+	lua.push_integer(0);
+	lua.push_function(lua_think);
+	lua.call(4, 0);
+	lua.pop();
+}
+
+unsafe fn stop_thinking(lua: GLuaState) {
+	lua.get_global(lua_string!("timer"));
+	lua.get_field(-1, lua_string!("Remove"));
+	lua.push_string("goqui");
+	lua.call(1, 0);
+	lua.pop();
 }
 
 fn speech_to_text(mut model_struct: LoadedCoquiModel, audio_path: String) -> Result<String, &'static str> {
@@ -233,8 +287,10 @@ unsafe fn lua_compute(lua: GLuaState) -> i32 {
 				return 2
 			},
 			
-			Ok(text) => {
-				lua.push_string(text.as_str());
+			Ok(_) => {
+				if increment_remaining() == 1 {start_thinking(lua)}
+				
+				lua.push_boolean(false);
 				
 				return 1
 			},
@@ -245,6 +301,13 @@ unsafe fn lua_compute(lua: GLuaState) -> i32 {
 	lua.push_string("invalid model name");
 	
 	2
+}
+
+#[lua_function]
+unsafe fn lua_count(lua: GLuaState) -> i32 {
+	lua.push_number(get_remaining() as f64);
+	
+	1
 }
 
 #[lua_function]
@@ -289,6 +352,15 @@ unsafe fn lua_model_exists(lua: GLuaState) -> i32 {
 	1
 }
 
+#[lua_function]
+unsafe fn lua_think(lua: GLuaState) -> i32 {
+	//TODO: write lua_think function internals")
+	
+	if get_remaining() == 0 {stop_thinking(lua)}
+	
+	0
+}
+
 #[gmod13_open]
 unsafe fn gmod13_open(lua: GLuaState) -> i32 {
 	if lua.is_client() {override_stdout()}
@@ -296,11 +368,13 @@ unsafe fn gmod13_open(lua: GLuaState) -> i32 {
 	println!("[Goqui] Loading Coqui speech to text for Garry's Mod...");
 	push_module_table(lua, lua_string!("goqui"));
 		add_module_function(lua, lua_string!("Compute"), lua_compute);
+		add_module_function(lua, lua_string!("Count"), lua_count);
 		add_module_function(lua, lua_string!("GetModelDetails"), lua_get_model_details);
 		add_module_function(lua, lua_string!("GetModels"), lua_get_models);
 		add_module_function(lua, lua_string!("ModelExists"), lua_model_exists);
+		add_module_function(lua, lua_string!("Think"), lua_think);
 	pop_module_table(lua, lua_string!("goqui"));
-	println!("[Goqui] Done laoding!");
+	println!("[Goqui] Done loading!");
 	
 	0
 }
