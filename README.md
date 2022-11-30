@@ -18,9 +18,15 @@ Don't create a timer named `goqui`, it will get overridden.
 All the functions listed below are available in the `goqui` table. Make sure `require("goqui")` is called once before using any of the functions. You don't need to head every file with it.
 |  Key  | Arguments | Returns | Description |
 | :---: | :-------: | :-----: | :---------- |
-| Compute | `string: file` `string: model` `function(string: text): callback` | `bool: success` `string: error` | Given the file path (relative to the data folder) and a model name, calls the callback function with transcribed speech. The `error` return will be `nil` if the `success` return is `true` |
+| Compute | `string: model` `string: file` `function(string: text): callback` | `bool: success` `string: error` | Given the file path (relative to the data folder) and a model name, calls the callback function with transcribed speech. The `error` return will be `nil` if the `success` return is `true` |
 | Count | | `number` | Returns the amount of `Compute` calls that are still processing. |
 | GetModelDetails | `string: model` | `table: details` | Returns a table of meta data about the stt model |
 | GetModels | | `table: models` | Returns a sequential table of model names. This is the name of the folder containing the model files in the `GarrysMod/garrysmod/lua/bin/goqui` folder. |
+| Listen8Bit | `string: model` `string: host` `number: port` | `bool: success` `string: error` | Creates a UDP socket that automatically performs speech-to-text for gmsv_eightbit integration. |
 | ModelExists | `string: model` | `bool` | Returns `true` if the model exists, or `false` if it doesn't. |
 | Think | | | Internal function that is used to run the `callback` function argument given to `Compute`. Runs using a timer named `goqui`. |
+
+### Hooks
+| Hook  | Arguments | Returns | Description |
+| :---: | :-------: | :-----: | :---------- |
+| GoquiEightBitHeard | `text: string` | | Response from `Listen8Bit`. |

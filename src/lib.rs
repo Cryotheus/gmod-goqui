@@ -1,25 +1,43 @@
-#![feature(c_unwind, once_cell)]
-//#![allow(dead_code, unused_assignments, unused_variables)] //debug only, will be removed in production
+#![feature(c_unwind, once_cell, slice_pattern)]
+#![allow(dead_code, unused_assignments, unused_variables)] //debug only, will be removed in production
 
 //test commands
 //lua_run_cl require("goqui") PrintTable(goqui.GetModels())
 //lua_run_cl print(goqui.Compute("goqui/gordead_ans18.wav", "en-us", function(...) print("callback!", ...) end))
 
+use byteorder::{LittleEndian, ReadBytesExt};
 use dasp_signal::Signal;
-use gmod::gmcl::override_stdout;
-use gmod::lua::{State as GLuaState, LuaFunction, LuaString};
 
+use gmod::{
+	lua::{State as GLuaState, LuaFunction, LuaString},
+	gmcl::override_stdout
+};
+
+use core::slice::SlicePattern;
 use std::{
-	cell::Cell,
 	collections::HashMap,
-	env::args,
 	fs::{File, ReadDir},
+	net::UdpSocket,
 	path::{Path, PathBuf},
-	sync::LazyLock,
+	sync::{LazyLock, Mutex},
+	thread
 };
 
 #[macro_use]
 extern crate gmod;
+
+//constants
+const VOICE_BUFFER_SIZE: usize = 636;
+const VOICE_COLLECTION_THRESHOLD: usize = 16;
+const VOICE_HEADED_SIZE: usize = VOICE_BUFFER_SIZE + 4;
+const VOICE_HEADED_64: u64 = VOICE_HEADED_SIZE as u64;
+const VOICE_SAMPLE_RATE: u32 = 24000;
+const VOICE_REPACKED_SIZE: usize = VOICE_BUFFER_SIZE * VOICE_COLLECTION_THRESHOLD;
+
+//types
+type E<'a> = core::result::Result<(), &'a str>;
+type VoiceBuilder = HashMap<u64, Vec<[u8; VOICE_BUFFER_SIZE]>>;
+type VoiceMerger = [[u8; VOICE_BUFFER_SIZE]; VOICE_COLLECTION_THRESHOLD];
 
 //structs
 struct LoadedCoquiModel {
@@ -56,7 +74,8 @@ impl LoadedCoquiModel {
 
 //statics
 static mut DATA_DIRECTORY: String = String::new();
-static GMOD_EXE: LazyLock<String> = LazyLock::new(|| args().next().expect("Goqui Failed to identify gmod.exe"));
+static GMOD_PATH: LazyLock<PathBuf> = LazyLock::new(|| std::env::current_dir().expect("failed to access working directory"));
+static mut VOICE_QUEUE: std::sync::Mutex<Vec<String>> = Mutex::new(vec![]);
 
 static MODEL_TABLE: LazyLock<HashMap<String, LoadedCoquiModel>> = LazyLock::new(|| {
 	let mut table = HashMap::new();
@@ -100,20 +119,20 @@ static MODEL_TABLE: LazyLock<HashMap<String, LoadedCoquiModel>> = LazyLock::new(
 	
 	//for easier error handling
 	let directory_iterator = || -> Result<ReadDir, &str> {
-		let mut gmod_exe_path = PathBuf::from(GMOD_EXE.as_str());
-		
-		if gmod_exe_path.to_str().is_none() {return Err("Incompatible gmod.exe path")};
-		while gmod_exe_path.file_name().unwrap() != "GarrysMod" && gmod_exe_path.pop() {} //ends_with was acting weird
-		if !gmod_exe_path.ends_with("GarrysMod") {return Err("failed to find GarrysMod directory")}
-		
 		//one day, this won't be unsafe :D
-		unsafe {DATA_DIRECTORY += &format!("{}/garrysmod/data/", gmod_exe_path.to_str().unwrap())}
+		//unsafe {DATA_DIRECTORY += &format!("{}/garrysmod/data/", gmod_exe_path.to_str().unwrap())}
+		//DATA_DIRECTORY
 		
-		gmod_exe_path.push("garrysmod/lua/bin/goqui");
+		let gmod_path = GMOD_PATH.to_str().unwrap();
+		let mut gmod_bin = GMOD_PATH.clone();
+		
+		unsafe {DATA_DIRECTORY = format!("{gmod_path}/garrysmod/data/")}
+		
+		gmod_bin.push("garrysmod/lua/bin/goqui");
 		
 		//give up if the directory doesn't exist and we fail to create it
-		if !gmod_exe_path.is_dir() && std::fs::create_dir_all(gmod_exe_path.as_os_str()).is_err() {return Err("failed to create garrysmod/lua/bin/goqui directory")}
-		if let Ok(model_directory) = gmod_exe_path.read_dir() {return Ok(model_directory)}
+		if !gmod_bin.is_dir() && std::fs::create_dir_all(gmod_bin.as_os_str()).is_err() {return Err("failed to create garrysmod/lua/bin/goqui directory")}
+		if let Ok(model_directory) = gmod_bin.read_dir() {return Ok(model_directory)}
 		
 		//or spit out that ambiguous error
 		Err("failed to access garrysmod/lua/bin/goqui directory")
@@ -151,44 +170,192 @@ static MODEL_TABLE: LazyLock<HashMap<String, LoadedCoquiModel>> = LazyLock::new(
 	table
 });
 
-thread_local! {static REMAINING: Cell<usize>  = Cell::new(0);}
-
 //functions
 unsafe fn add_module_function(lua: GLuaState, name: LuaString, func: LuaFunction) {
 	lua.push_function(func);
 	lua.set_field(-2, name);
 }
 
-fn decrement_remaining() -> usize {
-	let mut new = 0usize;
+/* source: https://github.com/Meachamp/voice-relay/blob/6164e90992b2435e17f9f8648317c2a0a6e3e821/server.js#L50-L101
+let decodeOpusFrames = (buf, encoderState, id64) => {
+	const maxRead = buf.length
+	let readPos = 0
+	let frames = []
+
+	let readable = encoderState.stream
+	let encoder = encoderState.encoder
+
+	while(readPos < maxRead - 4) {
+		let len = buf.readUInt16LE(readPos)
+		readPos += 2
+
+		let seq = buf.readUInt16LE(readPos)
+		readPos += 2
+
+		if(!encoderState.seq) {
+			encoderState.seq = seq
+		}
+
+		if(seq < encoderState.seq) {
+			encoderState.encoder = getEncoder()
+			encoderState.seq = 0
+		}
+		else if(encoderState.seq != seq) {
+			encoderState.seq = seq
+
+			let lostFrames = Math.min(seq - encoderState.seq, 16)
+
+			for(let i = 0; i < lostFrames; i++) {
+				frames.push(encoder.decodePacketloss())
+			}
+		}
+
+		encoderState.seq++;
+
+		if(len <= 0 || seq < 0 || readPos + len > maxRead) {
+			console.log(`Invalid packet LEN: ${len}, SEQ: ${seq}`)
+			fs.writeFileSync('pckt_corr.dat', buf)
+			return
+		}
+
+		const data = buf.slice(readPos, readPos + len)
+		readPos += len
+
+		let decodedFrame = encoder.decode(data)
+
+		frames.push(decodedFrame)
+	}
+
+	let decompressedData = Buffer.concat(frames)
+	readable.push(decompressedData)
+}
+*/
+
+/*
+	counter += 1;
+											
+	let mut wav_writer = audrey::hound::WavWriter::create(format!("{DATA_DIRECTORY}voice_{id}_{counter}.wav"),
+		audrey::hound::WavSpec {
+			bits_per_sample: 16,
+			channels: 1,
+			sample_format: audrey::hound::SampleFormat::Int,
+			sample_rate: VOICE_SAMPLE_RATE,
+		}
+	).unwrap();
+
+	for sample in output_buffer.iter() {wav_writer.write_sample(*sample).unwrap()}
+
+	wav_writer.flush();
+	wav_writer.finalize();
+*/
+
+unsafe fn listen_net<'a>(lua: GLuaState, host_address: &str, model_struct: &LoadedCoquiModel) -> E<'a> {
+	let Ok(test) = UdpSocket::bind(host_address) else {return Err("failed to bind UDP socket")};
+	let Ok(model_struct) = model_struct.clone() else {return Err("bruh")};
 	
-	REMAINING.with(|remaining| {
-		new = remaining.get() - 1;
+	if test.set_read_timeout(None).is_err() {return Err("failed to disable read timeout on UDP socket")};
+	
+	thread::spawn(move || {
+		let mut counter: u32 = 0;
+		let mut headed_buffer = [0u8; VOICE_HEADED_SIZE];
+		let mut read_buffer = [0u8; VOICE_BUFFER_SIZE];
+		//let mut sample_rate: u32 = 24000;
+		let Ok(mut decoder) = opus::Decoder::new(VOICE_SAMPLE_RATE, opus::Channels::Mono) else {return};
 		
-		remaining.set(new);
+		let mut voice_collection: VoiceBuilder = HashMap::new();
+		
+		loop {
+			if let Ok(udp_length) = test.recv(&mut headed_buffer) {
+			if let Ok(voice_queue) = VOICE_QUEUE.get_mut() {
+				let mut cursor = std::io::Cursor::new(headed_buffer);
+				let mut output_buffer = [0i16; VOICE_REPACKED_SIZE];
+				let udp_length = udp_length as u64;
+				let id = cursor.read_u64::<LittleEndian>().unwrap();
+				
+				while cursor.position() < udp_length {
+					let code = cursor.read_u8().unwrap();
+					let sixteen = cursor.read_u16::<LittleEndian>().unwrap();
+					
+					//println!("read u64 id {id} (i64 id {})\ncode is {code}\nsixteen is {sixteen}", id as i64);
+					
+					match code {
+						//11 => println!("decoded opcode to SAMPLE_RATE"),
+						
+						6 => {
+							//println!("decoded opcode to OPUSPLC");
+							
+							let goal = udp_length - 4;
+							
+							//shutup clippy
+							#[allow(clippy::needless_range_loop)]
+							while cursor.position() < goal {
+								let length = cursor.read_u16::<LittleEndian>().unwrap() as usize;
+								let read_iterator = read_buffer.iter_mut().enumerate();
+								let march = cursor.read_u16::<LittleEndian>().unwrap();
+								
+								if length == 2 {continue} //skip if there's nothing to do
+								if cursor.position() + length as u64 > goal {break} //dangerous
+								
+								for index in 0 .. length {read_buffer[index] = cursor.read_u8().unwrap()}
+								for index in length .. VOICE_BUFFER_SIZE {read_buffer[index] = 0}
+								
+								let mut collection = voice_collection.get_mut(&id);
+								
+								if collection.is_none() {
+									voice_collection.insert(id, vec![]);
+									
+									collection = voice_collection.get_mut(&id);
+								}
+								
+								let collection = collection.unwrap();
+								
+								if collection.len() == VOICE_COLLECTION_THRESHOLD {
+									let mut merger = [[0; VOICE_BUFFER_SIZE].as_slice(); VOICE_COLLECTION_THRESHOLD];
+									let mut repacked = [0; VOICE_REPACKED_SIZE];
+									let repacked_slice = repacked.as_mut_slice();
+									let mut packetizer = opus::Repacketizer::new().unwrap();
+									
+									for (index, buffer) in collection.iter().enumerate() {merger[index] = buffer.as_slice();}
+									
+									if packetizer.combine(merger.as_mut_slice(), repacked_slice).is_ok() {
+										match decoder.decode(repacked_slice, &mut output_buffer, false) {
+											Ok(bruh) => {
+												let Ok(model_struct) = model_struct.clone() else {continue};
+												
+												let mut wav_writer = audrey::hound::WavWriter::create(format!("{DATA_DIRECTORY}voice_{id}.wav"),
+													audrey::hound::WavSpec {
+														bits_per_sample: 8,
+														channels: 1,
+														sample_format: audrey::hound::SampleFormat::Int,
+														sample_rate: VOICE_SAMPLE_RATE,
+													}
+												).unwrap();
+												
+												for sample in output_buffer.iter() {wav_writer.write_sample(*sample).unwrap();}
+												
+												if let Ok(text) = speech_to_text(model_struct, output_buffer.to_vec()) {voice_queue.push(text)}
+											},
+											
+											Err(error) => {},//println!("opus error: {:?}", error),
+										}
+										
+										//speech_to_text(model_struct, output);
+										
+										//voice_queue.push(value)
+									}
+								} else {collection.push(read_buffer)}
+							}
+						},
+						
+						//0 => println!("decoded opcode to SILENCE"),
+						_ => {},
+					}
+				}
+			}}
+		}
 	});
 	
-	new
-}
-
-fn get_remaining() -> usize {
-	let mut output = 0usize;
-	
-	REMAINING.with(|remaining| output = remaining.get());
-	
-	output
-}
-
-fn increment_remaining() -> usize {
-	let mut new = 0usize;
-	
-	REMAINING.with(|remaining| {
-		new = remaining.get() + 1;
-		
-		remaining.set(new);
-	});
-	
-	new
+	Ok(())
 }
 
 unsafe fn pop_module_table(lua: GLuaState, table_name: LuaString) {lua.set_global(table_name)}
@@ -203,6 +370,8 @@ unsafe fn push_module_table(lua: GLuaState, table_name: LuaString) {
 }
 
 unsafe fn start_thinking(lua: GLuaState) {
+	println!("[Goqui (Debug)] start_thinking");
+	
 	lua.get_global(lua_string!("timer"));
 	lua.get_field(-1, lua_string!("Create"));
 	lua.push_string("goqui");
@@ -214,6 +383,8 @@ unsafe fn start_thinking(lua: GLuaState) {
 }
 
 unsafe fn stop_thinking(lua: GLuaState) {
+	println!("[Goqui (Debug)] stop_thinking");
+	
 	lua.get_global(lua_string!("timer"));
 	lua.get_field(-1, lua_string!("Remove"));
 	lua.push_string("goqui");
@@ -221,10 +392,15 @@ unsafe fn stop_thinking(lua: GLuaState) {
 	lua.pop();
 }
 
-fn speech_to_text(mut model_struct: LoadedCoquiModel, audio_path: String) -> Result<String, &'static str> {
-	//lua.push_string(text);
-	//lua.call(1, 0);
-	
+fn speech_to_text(mut model_struct: LoadedCoquiModel, audio_buffer: Vec<i16>) -> Result<String, &'static str> {
+	//reconstruct Result<String> into E
+	match model_struct.model.speech_to_text(&audio_buffer) {
+		Ok(text) => Ok(text),
+		_ => Err("internal Coqui computation error"),
+	}
+}
+
+fn prepare_file(model_struct: &LoadedCoquiModel, audio_path: String) -> Result<Vec<i16>, &'static str> {
 	let Ok(audio_file) = File::open(audio_path) else {return Err("failed to open file")};
 	let Ok(mut reader) = audrey::Reader::new(audio_file) else {return Err("failed to create audrey reader")};
 	let description = reader.description();
@@ -250,26 +426,24 @@ fn speech_to_text(mut model_struct: LoadedCoquiModel, audio_path: String) -> Res
 	if channel_count == 2 {audio_buffer = audio_buffer.chunks(2).map(|chunk| (chunk[0] + chunk[1]) / 2).collect()}
 	else if channel_count != 1 {return Err("audio must be stereo or mono")}
 	
-	//reconstruct Result<String> into Result<String, &'static str>
-	match model_struct.model.speech_to_text(&audio_buffer) {
-		Ok(text) => Ok(text),
-		_ => Err("internal Coqui computation error"),
-	}
+	Ok(audio_buffer)
 }
 
 //lua functions
 #[lua_function]
 unsafe fn lua_compute(lua: GLuaState) -> i32 {
-	let file_path = lua.check_string(1).to_string();
-	let model_key = lua.check_string(2).to_string();
+	let model_key = lua.check_string(1).to_string();
+	let file_path = lua.check_string(2).to_string();
 	
 	lua.check_function(3);
 	
+	if lua.is_function(-2) {println!("-2 is function")}
+	if lua.is_function(-1) {println!("-1 is function")}
+	if lua.is_function(0) {println!("0 is function")}
+	if lua.is_function(1) {println!("1 is function")}
+	if lua.is_function(2) {println!("2 is function")}
+	
 	if let Some(model_struct) = MODEL_TABLE.get(&model_key) {
-		//let bruh = &model_struct.name;
-		//lua.push_string(format!("nothing for now, but the {bruh} model would produce a string").as_str());
-		//lua.call(1, 0);
-		
 		let Ok(duplicated) = model_struct.clone() else {
 			lua.push_boolean(false);
 			lua.push_string("failed to duplicate model");
@@ -277,37 +451,25 @@ unsafe fn lua_compute(lua: GLuaState) -> i32 {
 			return 2
 		};
 		
-		let result = speech_to_text(duplicated, format!("{DATA_DIRECTORY}{file_path}"));
-		
-		match result {
-			Err(error) => {
-				lua.push_boolean(false);
-				lua.push_string(error);
-				
-				return 2
-			},
+		thread::spawn(move || {
+			let Ok(audio_buffer) = prepare_file(&duplicated, format!("{DATA_DIRECTORY}{file_path}")) else {return};
+			let result = speech_to_text(duplicated, audio_buffer);
 			
-			Ok(_) => {
-				if increment_remaining() == 1 {start_thinking(lua)}
-				
-				lua.push_boolean(false);
-				
-				return 1
-			},
-		}
+			match result {
+				Err(error) => {},
+				Ok(text) => {},
+			}
+		});
+		
+		lua.push_boolean(true);
+		
+		return 1
 	}
 	
 	lua.push_boolean(false);
 	lua.push_string("invalid model name");
 	
 	2
-}
-
-#[lua_function]
-unsafe fn lua_count(lua: GLuaState) -> i32 {
-	lua.push_number(get_remaining() as f64);
-	
-	1
 }
 
 #[lua_function]
@@ -353,10 +515,45 @@ unsafe fn lua_model_exists(lua: GLuaState) -> i32 {
 }
 
 #[lua_function]
-unsafe fn lua_think(lua: GLuaState) -> i32 {
-	//TODO: write lua_think function internals")
+unsafe fn lua_listen(lua: GLuaState) -> i32 {
+	let model_key = lua.check_string(1).to_string();
+	let host_address = lua.check_string(2).to_string();
+	let host_port = lua.check_integer(3) as u16;
+	let compounded_address = format!("{host_address}:{host_port}");
 	
-	if get_remaining() == 0 {stop_thinking(lua)}
+	let Some(model_struct) = MODEL_TABLE.get(&model_key) else {
+		lua.push_boolean(false);
+		lua.push_string("invalid model name");
+		
+		return 2
+	};
+	
+	if let Err(error) = listen_net(lua, compounded_address.as_str(), model_struct) {
+		lua.push_boolean(false);
+		lua.push_string(error);
+		
+		return 2
+	}
+	
+	lua.push_boolean(true);
+	
+	1
+}
+
+#[lua_function]
+unsafe fn lua_think(lua: GLuaState) -> i32 {
+	if let Ok(voice_heard) = VOICE_QUEUE.get_mut() {
+		while let Some(text) = voice_heard.pop() {
+			//lua_stack_guard!(lua => {
+				lua.get_global(lua_string!("hook"));
+				lua.get_field(-1, lua_string!("Run"));
+				lua.push_string("GoquiEightBitHeard");
+				lua.push_string(text.as_str());
+				lua.call(2, 0);
+				lua.pop();
+			//});
+		}
+	}
 	
 	0
 }
@@ -365,15 +562,16 @@ unsafe fn lua_think(lua: GLuaState) -> i32 {
 unsafe fn gmod13_open(lua: GLuaState) -> i32 {
 	if lua.is_client() {override_stdout()}
 	
-	println!("[Goqui] Loading Coqui speech to text for Garry's Mod...");
+	println!("[Goqui] Loading Coqui speech-to-text for Garry's Mod...");
 	push_module_table(lua, lua_string!("goqui"));
 		add_module_function(lua, lua_string!("Compute"), lua_compute);
-		add_module_function(lua, lua_string!("Count"), lua_count);
 		add_module_function(lua, lua_string!("GetModelDetails"), lua_get_model_details);
 		add_module_function(lua, lua_string!("GetModels"), lua_get_models);
+		add_module_function(lua, lua_string!("Listen8Bit"), lua_listen);
 		add_module_function(lua, lua_string!("ModelExists"), lua_model_exists);
 		add_module_function(lua, lua_string!("Think"), lua_think);
 	pop_module_table(lua, lua_string!("goqui"));
+	start_thinking(lua);
 	println!("[Goqui] Done loading!");
 	
 	0
